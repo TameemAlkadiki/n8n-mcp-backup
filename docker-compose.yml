@@ -1,0 +1,144 @@
+# ── n8n Backup MCP Infrastructure ─────────────────────────────────────────────
+#
+# Services
+#   n8n         – the automation engine, persisted via a named volume
+#   mcp-server  – the FastMCP backup bridge; kept alive so Claude Desktop can
+#                 reach it via:  docker exec -i mcp_backup_server python server.py
+#   garage      – S3-compatible object storage (Garage v1.3.1)
+#                 You can swap this for MinIO or any S3-compatible backend by
+#                 updating the S3_* environment variables in .env
+#   garage-webui– Web UI for browsing Garage buckets
+#   postgres    – PostgreSQL database (optional, for Postgres backup tools)
+#
+# First-time setup
+#   1. cp .env.example .env
+#   2. Fill in all required values in .env
+#   3. Configure Garage: see https://garagehq.deuxfleurs.fr/documentation/quick-start/
+#      and place your garage.toml at ./garage/config/garage.toml
+#   4. docker compose up -d
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── 1. n8n Automation Engine ────────────────────────────────────────────────
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n_server
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # REQUIRED: stable encryption key for saved credentials.
+      # If this changes, all stored credentials become unreadable.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      # Optional but recommended hardening
+      N8N_USER_MANAGEMENT_DISABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"        # 14 days in hours
+      N8N_METRICS: "false"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── 2. MCP Backup Server ────────────────────────────────────────────────────
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp_backup_server
+    restart: unless-stopped
+    # Keep the container alive; Claude Desktop invokes the server via:
+    #   docker exec -i mcp_backup_server python server.py
+    # This is intentional: FastMCP uses stdio transport, so the process is
+    # spawned per-session rather than running as a persistent HTTP service.
+    command: tail -f /dev/null
+    environment:
+      N8N_URL:     ${N8N_URL:-http://n8n:5678}
+      N8N_API_KEY: ${N8N_API_KEY}
+      BACKUP_DIR:  /app/backups
+      S3_ENDPOINT:        ${S3_ENDPOINT:-http://garage:3900}
+      S3_REGION:          ${S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID:   ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET:          ${S3_BUCKET:-n8n-backup}
+      S3_BUCKET_POSTGRES: ${S3_BUCKET_POSTGRES:-postgres-backup}
+      PG_HOST:     ${PG_HOST:-postgres}
+      PG_PORT:     ${PG_PORT:-5432}
+      PG_DB:       ${PG_DB}
+      PG_USER:     ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      - ./backups:/app/backups
+    depends_on:
+      n8n:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  # ── 3. Garage S3-Compatible Object Storage ──────────────────────────────────
+  # See https://garagehq.deuxfleurs.fr/documentation/quick-start/ for setup.
+  # Place your garage.toml at ./garage/config/garage.toml before starting.
+  garage:
+    image: dxflrs/garage:v1.3.1
+    container_name: garage
+    restart: unless-stopped
+    ports:
+      - "3900:3900"   # S3 API
+      - "3901:3901"   # RPC
+      - "3903:3903"   # Admin API
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET}
+    volumes:
+      - ./garage/config/garage.toml:/etc/garage.toml:ro
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+
+  # ── 4. Garage Web UI ─────────────────────────────────────────────────────────
+  garage-webui:
+    image: khairul169/garage-webui:1.0.9
+    container_name: garage_webui
+    restart: unless-stopped
+    ports:
+      - "3909:3909"
+    environment:
+      API_ADMIN_KEY: ${GARAGE_ADMIN_TOKEN}
+      API_BASE_URL: http://garage:3903
+    depends_on:
+      - garage
+
+  # ── 5. PostgreSQL Database ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  n8n_data:
+    driver: local
+  garage_meta:
+    driver: local
+  garage_data:
+    driver: local
+  postgres_data:
+    driver: local
